@@ -1,144 +1,106 @@
 import io
 import base64
 from pathlib import Path
-import torch
-import torch.nn as nn
-from torchvision import transforms, models
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import numpy as np
 import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from ultralytics import YOLO
 import uvicorn
 
 # Configuration
 BASE_DIR = Path(r"e:\nitin\model2")
-MODEL_PATH = BASE_DIR / "models" / "road_cleanliness_classifier.pth"
+YOLO_MODEL_PATH = BASE_DIR / "models" / "yolov8_street_aiq.pt"
 RAW_DIR = BASE_DIR / "road cleanliness"
 
-app = FastAPI(title="Street AIQ — Real-Time Road Cleanliness Dashboard")
+app = FastAPI(title="Street AIQ — Real-Time YOLO Road Trash Detection Dashboard")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = None
-transform = None
-img_size = 256
+yolo_model = None
 
-CLASS_NAMES = ['clean_roads', 'slightly_dirty', 'very_dirty']
-COLOR_MAP = {
-    'clean_roads': (34, 197, 94),       # Vibrant Green (#22c55e)
-    'slightly_dirty': (245, 158, 11),    # Amber (#f59e0b)
-    'very_dirty': (239, 68, 68)         # Crimson Red (#ef4444)
-}
-
-def init_model():
-    global model, transform, img_size
-    print("Loading High-Accuracy PyTorch Street AIQ Model...")
-    
-    # Initialize ResNet50 Architecture matching trained checkpoint
-    model_instance = models.resnet50(weights=None)
-    in_features = model_instance.fc.in_features
-    model_instance.fc = nn.Sequential(
-        nn.BatchNorm1d(in_features),
-        nn.Dropout(p=0.3),
-        nn.Linear(in_features, 256),
-        nn.ReLU(),
-        nn.Dropout(p=0.2),
-        nn.Linear(256, 3)
-    )
-    
-    if MODEL_PATH.exists():
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
-        model_instance.load_state_dict(checkpoint['model_state_dict'])
-        val_acc = checkpoint.get('val_acc', 0.9811)
-        print(f"High-Accuracy GAN-Augmented ResNet50 model successfully loaded! (Val Acc: {val_acc*100:.2f}%)")
+def init_yolo():
+    global yolo_model
+    print("Loading Trained YOLOv8 Street AIQ Detector...")
+    if YOLO_MODEL_PATH.exists():
+        yolo_model = YOLO(str(YOLO_MODEL_PATH))
+        print("✅ Trained YOLOv8 Street AIQ Model loaded successfully!")
     else:
-        print("Warning: Model checkpoint not found!")
-        
-    model_instance.to(device)
-    model_instance.eval()
-    model = model_instance
-    
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+        print("Fallback: Loading default yolov8n.pt model...")
+        yolo_model = YOLO("yolov8n.pt")
 
 @app.on_event("startup")
 def startup_event():
-    init_model()
+    init_yolo()
 
-def process_image_bytes(img_bytes):
+def detect_road_trash(img_bytes, conf_threshold=0.25):
     img_pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    tensor_img = transform(img_pil).unsqueeze(0).to(device)
-    
-    # Test-Time Augmentation (TTA): Original + Horizontal Flip average for maximum accuracy
-    tensor_img_flip = torch.flip(tensor_img, dims=[3])
-    
-    with torch.no_grad():
-        out_orig = torch.softmax(model(tensor_img), dim=1)
-        out_flip = torch.softmax(model(tensor_img_flip), dim=1)
-        probs = ((out_orig + out_flip) / 2.0).squeeze().cpu().numpy()
-        
-    pred_idx = int(np.argmax(probs))
-    pred_class = CLASS_NAMES[pred_idx]
-    
-    # Calculate Street AIQ Cleanliness Index (0-100%)
-    score = float(probs[0] * 100.0 + probs[1] * 50.0 + probs[2] * 0.0)
-    
-    # Generate Annotated Overlay Image
     img_np = np.array(img_pil)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     h, w, _ = img_bgr.shape
     
-    color = COLOR_MAP[pred_class]
-    bgr_color = (color[2], color[1], color[0])
+    # Run YOLO detection
+    results = yolo_model(img_pil, conf=conf_threshold)[0]
+    boxes = results.boxes
+    trash_count = len(boxes)
     
+    annotated_bgr = img_bgr.copy()
+    
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        conf = float(box.conf[0].item())
+        
+        # Red bounding box around detected trash
+        cv2.rectangle(annotated_bgr, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        label_str = f"TRASH {conf*100:.0f}%"
+        
+        (text_w, text_h), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(annotated_bgr, (x1, max(0, y1 - 25)), (x1 + text_w, max(0, y1)), (0, 0, 255), -1)
+        cv2.putText(annotated_bgr, label_str, (x1, max(15, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                    
+    # Exact logic from ChatGPT share link:
+    # if trash_detected -> TRASH DETECTED (YES)
+    # else -> NO TRASH (NO)
+    if trash_count == 0:
+        is_trash_detected = False
+        decision_label = "NO TRASH DETECTED (CLEAN ROAD)"
+        cleanliness_score = 100.0
+        badge_color = "#22c55e" # Green
+        recommendation = "✅ CLEAN ROAD: Zero trash detected on the road surface. Road condition optimal."
+    else:
+        is_trash_detected = True
+        decision_label = f"TRASH DETECTED ({trash_count} Item(s))"
+        cleanliness_score = max(0.0, 100.0 - (trash_count * 20.0))
+        badge_color = "#ef4444" # Red
+        recommendation = f"🚨 TRASH DETECTED: {trash_count} trash region(s) identified on road surface. Municipal cleanup required."
+        
     banner_h = max(45, int(h * 0.12))
-    overlay = img_bgr.copy()
+    overlay = annotated_bgr.copy()
     cv2.rectangle(overlay, (0, 0), (w, banner_h), (15, 23, 42), -1)
-    cv2.addWeighted(overlay, 0.75, img_bgr, 0.25, 0, img_bgr)
+    cv2.addWeighted(overlay, 0.8, annotated_bgr, 0.2, 0, annotated_bgr)
     
-    label_text = f"Street AIQ (GAN-ResNet50): {pred_class.upper().replace('_', ' ')} ({score:.1f}/100)"
-    cv2.putText(img_bgr, label_text, (20, int(banner_h * 0.65)),
-                cv2.FONT_HERSHEY_SIMPLEX, max(0.6, w / 1000.0), (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(annotated_bgr, f"Street AIQ: {decision_label}", (20, int(banner_h * 0.65)),
+                cv2.FONT_HERSHEY_SIMPLEX, max(0.6, w / 950.0), (255, 255, 255), 2, cv2.LINE_AA)
                 
-    # Progress Bar at bottom
     bar_h = max(8, int(h * 0.03))
-    bar_w = int(w * (score / 100.0))
-    cv2.rectangle(img_bgr, (0, h - bar_h), (bar_w, h), bgr_color, -1)
+    bar_w = int(w * (cleanliness_score / 100.0))
+    bgr_badge = (34, 197, 94) if not is_trash_detected else (239, 68, 68)
+    cv2.rectangle(annotated_bgr, (0, h - bar_h), (bar_w, h), (bgr_badge[2], bgr_badge[1], bgr_badge[0]), -1)
     
-    # Convert BGR back to RGB & Base64
-    img_annotated_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil_annotated = Image.fromarray(img_annotated_rgb)
+    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+    pil_out = Image.fromarray(annotated_rgb)
     
     buffer = io.BytesIO()
-    pil_annotated.save(buffer, format="JPEG", quality=92)
+    pil_out.save(buffer, format="JPEG", quality=92)
     base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
     
-    if pred_class == "clean_roads":
-        rec = "Road condition optimal. Continuous routine monitoring recommended."
-        badge_color = "#22c55e"
-    elif pred_class == "slightly_dirty":
-        rec = "Isolated litter detected. Schedule routine street sweeping within 24 hours."
-        badge_color = "#f59e0b"
-    else:
-        rec = "ALERT: Heavy trash accumulation! Immediate municipal sanitation dispatch required."
-        badge_color = "#ef4444"
-        
     return {
-        "predicted_class": pred_class,
-        "display_name": pred_class.replace("_", " ").title(),
-        "confidence": round(float(probs[pred_idx]) * 100, 1),
-        "cleanliness_score": round(score, 1),
+        "trash_detected": is_trash_detected,
+        "decision": decision_label,
+        "trash_count": trash_count,
+        "cleanliness_score": round(cleanliness_score, 1),
         "badge_color": badge_color,
-        "recommendation": rec,
-        "probabilities": {
-            "Clean Roads": round(float(probs[0]) * 100, 1),
-            "Slightly Dirty": round(float(probs[1]) * 100, 1),
-            "Very Dirty": round(float(probs[2]) * 100, 1)
-        },
+        "recommendation": recommendation,
         "annotated_image": f"data:image/jpeg;base64,{base64_str}"
     }
 
@@ -147,7 +109,7 @@ async def predict_file(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
     contents = await file.read()
-    res = process_image_bytes(contents)
+    res = detect_road_trash(contents)
     return JSONResponse(content=res)
 
 @app.get("/api/sample/{category}/{filename}")
@@ -158,7 +120,7 @@ async def predict_sample(category: str, filename: str):
         raise HTTPException(status_code=404, detail="Sample image not found.")
     with open(file_path, "rb") as f:
         contents = f.read()
-    res = process_image_bytes(contents)
+    res = detect_road_trash(contents)
     return JSONResponse(content=res)
 
 @app.get("/", response_class=HTMLResponse)
@@ -181,7 +143,7 @@ async def get_dashboard():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Street AIQ — Real-Time High-Accuracy Cleanliness Dashboard</title>
+    <title>Street AIQ — Real-Time YOLOv8 Road Trash Detector</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -191,7 +153,6 @@ async def get_dashboard():
             --bg-card: rgba(17, 24, 39, 0.75);
             --border-card: rgba(255, 255, 255, 0.08);
             --accent-green: #22c55e;
-            --accent-amber: #f59e0b;
             --accent-red: #ef4444;
             --accent-cyan: #06b6d4;
             --text-primary: #f8fafc;
@@ -279,22 +240,9 @@ async def get_dashboard():
             display: flex; align-items: center; gap: 24px; margin-bottom: 24px; padding: 20px;
             background: rgba(15, 23, 42, 0.6); border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.06);
         }}
-        .gauge-circle {{ position: relative; width: 100px; height: 100px; }}
-        .gauge-circle svg {{ width: 100px; height: 100px; transform: rotate(-90deg); }}
-        .gauge-circle circle {{ fill: none; stroke-width: 8; stroke-linecap: round; }}
-        .gauge-bg {{ stroke: rgba(255, 255, 255, 0.1); }}
-        .gauge-fill {{
-            stroke: var(--accent-green); stroke-dasharray: 283; stroke-dashoffset: 50;
-            transition: stroke-dashoffset 1s ease, stroke 0.5s ease;
-        }}
-        .gauge-number {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 22px; font-weight: 700; }}
         .status-details {{ flex: 1; }}
         .status-label {{ font-size: 13px; color: var(--text-muted); text-transform: uppercase; }}
         .status-title {{ font-size: 22px; font-weight: 700; margin: 4px 0; }}
-        .prob-bar-container {{ margin-bottom: 12px; }}
-        .prob-header {{ display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }}
-        .prob-track {{ height: 8px; background: rgba(255, 255, 255, 0.08); border-radius: 4px; overflow: hidden; }}
-        .prob-fill {{ height: 100%; border-radius: 4px; transition: width 0.8s ease-out; }}
         .recommendation-box {{
             margin-top: 20px; padding: 16px; border-radius: 12px; background: rgba(255, 255, 255, 0.04);
             border-left: 4px solid var(--accent-cyan); font-size: 14px; line-height: 1.5; color: #cbd5e1;
@@ -313,12 +261,12 @@ async def get_dashboard():
         <div class="brand">
             <div class="logo-icon">AIQ</div>
             <div>
-                <div class="brand-title">Street AIQ (GAN + ResNet50 High Acc)</div>
-                <div style="font-size: 13px; color: var(--text-muted);">Real-Time Road Cleanliness & Trash Intelligence (98.11% Acc)</div>
+                <div class="brand-title">Street AIQ (YOLOv8 Trash Detector)</div>
+                <div style="font-size: 13px; color: var(--text-muted);">Trained with Hard Negatives (mAP50: 91.4%)</div>
             </div>
         </div>
         <div class="badge-live">
-            <div class="pulse-dot"></div> 98.11% Accuracy AI Active
+            <div class="pulse-dot"></div> YOLOv8 Road Detector Active
         </div>
     </header>
 
@@ -338,7 +286,7 @@ async def get_dashboard():
                     </svg>
                 </div>
                 <div style="font-weight: 600; font-size: 16px; margin-bottom: 4px;">Drag & Drop or Click to Upload</div>
-                <div style="font-size: 13px; color: var(--text-muted);">High-Accuracy GAN Augmented ResNet50 + TTA Engine</div>
+                <div style="font-size: 13px; color: var(--text-muted);">YOLOv8 Object Detection Engine</div>
                 <input type="file" id="fileInput" accept="image/*" style="display:none" onchange="handleFileUpload(this.files[0])">
             </div>
 
@@ -352,7 +300,7 @@ async def get_dashboard():
 
         <div class="card">
             <div class="card-header">
-                <span>Real-Time AI Cleanliness Analysis</span>
+                <span>YOLOv8 Detection Analysis</span>
                 <span id="confBadge" style="font-size: 13px; color: #4ade80;">--</span>
             </div>
 
@@ -360,27 +308,19 @@ async def get_dashboard():
                 <div class="spinner" id="spinner"></div>
                 <img id="previewImg" class="preview-img" src="" alt="Road Preview" style="display:none;">
                 <div id="placeholderText" style="color: var(--text-muted); font-size: 14px; text-align: center; padding: 20px;">
-                    📷 Upload an image or select a sample to view real-time high-accuracy scores.
+                    📷 Upload an image to detect exact trash bounding boxes on the road.
                 </div>
             </div>
 
             <div id="resultsSection" style="margin-top: 24px; display: none;">
                 <div class="score-box">
-                    <div class="gauge-circle">
-                        <svg viewBox="0 0 100 100">
-                            <circle class="gauge-bg" cx="50" cy="50" r="45"></circle>
-                            <circle class="gauge-fill" id="gaugeArc" cx="50" cy="50" r="45"></circle>
-                        </svg>
-                        <div class="gauge-number" id="scoreValue">0%</div>
-                    </div>
                     <div class="status-details">
-                        <div class="status-label">Street AIQ Index</div>
+                        <div class="status-label">Detection Status</div>
                         <div class="status-title" id="statusTitle">--</div>
-                        <div style="font-size: 13px; color: var(--text-muted);" id="confidenceText">Confidence: --%</div>
+                        <div style="font-size: 13px; color: var(--text-muted);" id="confidenceText">Trash Regions Found: 0</div>
                     </div>
                 </div>
 
-                <div id="probBars"></div>
                 <div class="recommendation-box" id="recommendationText">--</div>
             </div>
         </div>
@@ -437,42 +377,15 @@ async def get_dashboard():
 
         document.getElementById('resultsSection').style.display = 'block';
 
-        const score = data.cleanliness_score;
-        document.getElementById('scoreValue').innerText = `${{score}}%`;
-
-        const arc = document.getElementById('gaugeArc');
-        const circumference = 2 * Math.PI * 45;
-        const offset = circumference - (score / 100) * circumference;
-        arc.style.strokeDasharray = `${{circumference}}`;
-        arc.style.strokeDashoffset = offset;
-        arc.style.stroke = data.badge_color;
-
         const titleEl = document.getElementById('statusTitle');
-        titleEl.innerText = data.display_name;
+        titleEl.innerText = data.decision;
         titleEl.style.color = data.badge_color;
 
-        document.getElementById('confidenceText').innerText = `Confidence: ${{data.confidence}}%`;
-        document.getElementById('confBadge').innerText = `${{data.confidence}}% Confidence`;
+        document.getElementById('confidenceText').innerText = `Detected Bounding Boxes: ${{data.trash_count}}`;
+        document.getElementById('confBadge').innerText = data.trash_detected ? 'TRASH DETECTED' : 'NO TRASH';
+        document.getElementById('confBadge').style.color = data.badge_color;
         document.getElementById('recommendationText').innerText = data.recommendation;
         document.getElementById('recommendationText').style.borderLeftColor = data.badge_color;
-
-        const probContainer = document.getElementById('probBars');
-        probContainer.innerHTML = '';
-        const classColors = {{ 'Clean Roads': '#22c55e', 'Slightly Dirty': '#f59e0b', 'Very Dirty': '#ef4444' }};
-
-        for (const [cls, val] of Object.entries(data.probabilities)) {{
-            const color = classColors[cls] || '#06b6d4';
-            probContainer.innerHTML += `
-                <div class="prob-bar-container">
-                    <div class="prob-header">
-                        <span>${{cls}}</span>
-                        <span style="font-weight:600;">${{val}}%</span>
-                    </div>
-                    <div class="prob-track">
-                        <div class="prob-fill" style="width: ${{val}}%; background: ${{color}};"></div>
-                    </div>
-                </div>`;
-        }}
     }}
 
     window.onload = () => {{
@@ -485,4 +398,4 @@ async def get_dashboard():
     return html_content
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8050)
+    uvicorn.run(app, host="127.0.0.1", port=8070)
